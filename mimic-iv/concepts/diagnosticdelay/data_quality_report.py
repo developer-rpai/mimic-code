@@ -20,6 +20,7 @@ Example (DuckDB, after building the derived concepts)::
         --duckdb ~/data/mimic-iv.duckdb \\
         --schema mimiciv_derived \\
         --raw-schema mimiciv_icu \\
+        --raw-hosp-schema mimiciv_hosp \\
         --output delay_data_quality.md
 
 The aggregation SQL is plain portable SQL (no engine-specific
@@ -80,15 +81,34 @@ def connect(args):
     return con
 
 
+def _cursor(con):
+    """Return something executable for this DB-API connection.
+
+    psycopg2 connections expose no ``execute`` method -- queries must go
+    through an explicit cursor. DuckDB connections execute directly.
+    """
+    return con if hasattr(con, "execute") else con.cursor()
+
+
 def fetchone(con, sql, params=()):
-    cur = con.execute(sql, params)
-    return cur.fetchone()
+    cur = _cursor(con)
+    try:
+        cur.execute(sql, params)
+        return cur.fetchone()
+    finally:
+        if cur is not con:
+            cur.close()
 
 
 def fetchall(con, sql, params=()):
-    cur = con.execute(sql, params)
-    cols = [d[0] for d in cur.description]
-    return cols, cur.fetchall()
+    cur = _cursor(con)
+    try:
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return cols, cur.fetchall()
+    finally:
+        if cur is not con:
+            cur.close()
 
 
 def table_exists(con, schema, table):
@@ -143,25 +163,29 @@ def cohort_stats(con, schema):
     return stats
 
 
-def coverage_stats(con, raw_schema):
+def coverage_stats(con, icu_schema, hosp_schema=None):
     """Cohort capture rate against the raw icustays denominator.
 
-    Denominator mirrors the cohort filters (adult, ED origin) without
-    requiring a suspected-infection episode. Returns None when the raw
-    tables are unavailable. The age filter reproduces the concept's
+    ``icustays`` lives in the ICU schema (``mimiciv_icu``); ``admissions``
+    and ``patients`` live in the hospital schema (``mimiciv_hosp``), so the
+    two schema names are accepted separately. Denominator mirrors the
+    cohort filters (adult, ED origin) without requiring a
+    suspected-infection episode. Returns None when the raw tables are
+    unavailable. The age filter reproduces the concept's
     ``anchor_age + year(admittime) - anchor_year`` formula with
     engine-portable date parts.
     """
+    hosp_schema = hosp_schema or icu_schema
     try:
         cols, rows = fetchall(
             con,
             f"""
             SELECT COUNT(*) AS n_adult_ed_icu_stays
                 , COUNT(DISTINCT ie.subject_id) AS n_patients
-            FROM {raw_schema}.icustays ie
-            INNER JOIN {raw_schema}.admissions adm
+            FROM {icu_schema}.icustays ie
+            INNER JOIN {hosp_schema}.admissions adm
                 ON ie.hadm_id = adm.hadm_id
-            INNER JOIN {raw_schema}.patients pat
+            INNER JOIN {hosp_schema}.patients pat
                 ON ie.subject_id = pat.subject_id
             WHERE pat.anchor_age
                     + DATE_PART('YEAR', adm.admittime)
@@ -254,7 +278,7 @@ def onset_window_counts(con, schema):
     return [dict(zip(cols, r)) for r in rows]
 
 
-def build_report(con, schema, raw_schema):
+def build_report(con, schema, raw_schema, raw_hosp_schema=None):
     if not table_exists(con, schema, COHORT_TABLE):
         sys.exit(f"table {schema}.{COHORT_TABLE} not found")
     if not table_exists(con, schema, DELAY_TABLE):
@@ -269,7 +293,7 @@ def build_report(con, schema, raw_schema):
         "onset_windows": onset_window_counts(con, schema),
     }
     if raw_schema:
-        report["coverage"] = coverage_stats(con, raw_schema)
+        report["coverage"] = coverage_stats(con, raw_schema, raw_hosp_schema)
     return report
 
 
@@ -345,8 +369,14 @@ def main(argv=None):
     parser.add_argument(
         "--raw-schema",
         default=None,
-        help="raw schema with icustays/admissions/patients "
-        "(enables the coverage denominator)",
+        help="raw ICU schema with icustays (enables the coverage "
+        "denominator)",
+    )
+    parser.add_argument(
+        "--raw-hosp-schema",
+        default=None,
+        help="raw hospital schema with admissions/patients "
+        "(defaults to --raw-schema)",
     )
     parser.add_argument(
         "--output", default=None, help="write the Markdown report here"
@@ -360,7 +390,9 @@ def main(argv=None):
 
     con = connect(args)
     try:
-        report = build_report(con, args.schema, args.raw_schema)
+        report = build_report(
+            con, args.schema, args.raw_schema, args.raw_hosp_schema
+        )
     finally:
         con.close()
 
