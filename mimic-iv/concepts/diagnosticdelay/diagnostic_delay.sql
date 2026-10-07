@@ -70,10 +70,16 @@ SELECT
     , dd.admission_to_antibiotic_hours
     , dd.admission_to_culture_hours
     , dd.culture_to_antibiotic_hours
-    -- onset window relative to hospital admission
+    -- onset window relative to hospital admission. Classified from the raw
+    -- timestamps rather than the rounded delay measures above: e.g. a
+    -- suspicion 2 minutes before admission rounds to a delay of -0.0 (not
+    -- < 0) and a suspicion 48 hours 2 minutes after admission rounds to
+    -- 48.0 (not > 48), both of which the rounded form misclassified.
     , CASE
-        WHEN dd.admission_to_suspicion_hours < 0 THEN 'pre_admission'
-        WHEN dd.admission_to_suspicion_hours <= 48 THEN 'present_on_admission'
+        WHEN dd.first_suspicion_time < dd.admittime THEN 'pre_admission'
+        WHEN dd.first_suspicion_time <= DATETIME_ADD(
+            dd.admittime, INTERVAL 48 HOUR
+        ) THEN 'present_on_admission'
         ELSE 'hospital_onset'
     END AS onset_window
     -- temporal-plausibility flags (1 = implausible, 0 = plausible,
